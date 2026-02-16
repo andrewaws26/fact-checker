@@ -20,24 +20,23 @@ st.markdown("""
 # --- Security: UI-Based Key Input ---
 with st.sidebar:
     st.title("⚙️ Settings")
-    
-    # 1. Check if key exists in st.secrets (from .streamlit/secrets.toml)
+    # Try to get from secrets first, otherwise empty
     default_key = st.secrets.get("TAVILY_API_KEY", "")
     
-    # 2. Provide a UI input. If default_key exists, it fills it automatically.
-    # type="password" hides the characters as you type.
     user_key = st.text_input(
         "Enter Tavily API Key", 
         value=default_key, 
         type="password",
         help="Get your key at app.tavily.com"
     )
-    
-    st.info("Your key is used only for this session and is not stored by this app.")
+    st.info("This app uses Tavily's Research Agent to cross-reference news claims.")
 
 # --- Helper Functions ---
 def get_grade_styling(report_text):
-    match = re.search(r'#\s*([A-DF])', report_text)
+    """Safely extracts the grade from text."""
+    # Ensure we are dealing with a string
+    text_to_search = str(report_text) 
+    match = re.search(r'#\s*([A-DF])', text_to_search)
     grade = match.group(1) if match else "N/A"
     colors = {"A": "#2ecc71", "B": "#3498db", "C": "#f1c40f", "D": "#e67e22", "F": "#e74c3c", "N/A": "#95a5a6"}
     return grade, colors.get(grade, "#95a5a6")
@@ -48,12 +47,19 @@ def run_news_audit(url, api_key):
     audit_prompt = f"""
     Role: Consumer Protection Auditor & News Critic.
     Task: Grade the following article for a general audience: {url}
-    Instructions: Provide a # [Letter Grade], 'The Quick Verdict', 'The Red Flags', and 'Verified Facts'. 
+    Instructions: Provide a # [Letter Grade] at the very top, then 'The Quick Verdict', 'The Red Flags', and 'Verified Facts'. 
     Use simple language.
     """
     
-    # Use 'input=' for the research method
-    return tavily.research(input=audit_prompt)
+    # Trigger the agent
+    response = tavily.research(input=audit_prompt)
+    
+    # If the response is a dictionary (common with the research endpoint), 
+    # we convert it to a string for display and regex processing.
+    if isinstance(response, dict):
+        # Most Tavily Agent responses put the main text in 'content' or 'output'
+        return response.get("output", str(response))
+    return response
 
 # --- Main App UI ---
 st.title("⚖️ NewsGrader AI")
@@ -63,7 +69,7 @@ url_input = st.text_input("Article URL", placeholder="https://www.example.com/ne
 
 if st.button("Audit Article", use_container_width=True):
     if not user_key:
-        st.error("Please enter a Tavily API Key in the sidebar to continue.")
+        st.error("Please enter a Tavily API Key in the sidebar.")
     elif not url_input:
         st.error("Please provide a valid news URL.")
     else:
@@ -71,7 +77,7 @@ if st.button("Audit Article", use_container_width=True):
             try:
                 st.write("Extracting claims and searching the live web...")
                 
-                # Use the key provided in the UI
+                # Run the audit (now handles the dictionary error)
                 report_content = run_news_audit(url_input, user_key)
                 
                 status.update(label="Audit Complete!", state="complete", expanded=False)
@@ -84,4 +90,7 @@ if st.button("Audit Article", use_container_width=True):
                 st.markdown(report_content)
                 
             except Exception as e:
-                st.error(f"Error: {e}. Check if your API key is valid.")
+                # Improved error reporting
+                st.error(f"Error during audit: {e}")
+                if "invalid api key" in str(e).lower():
+                    st.info("Your API key seems incorrect. Please double-check it in the sidebar.")
