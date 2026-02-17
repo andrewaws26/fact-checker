@@ -17,15 +17,11 @@ st.markdown("""
 
 # --- 3. Helper: JSON Cleaner ---
 def parse_final_json(raw_data):
-    # If it's already a dictionary, return it
     if isinstance(raw_data, dict): return raw_data
     if not raw_data: return None
-    
     text = str(raw_data)
-    # Remove markdown code fences
     match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
     if match: text = match.group(1)
-    
     try:
         return json.loads(text)
     except:
@@ -51,7 +47,7 @@ if run_btn:
         st.error("Please check your API Key and URL.")
         st.stop()
     
-    # Clean API Key
+    # Clean Key
     safe_key = str(api_key).strip()
     try: safe_key = safe_key.encode("ascii", "ignore").decode("ascii")
     except: pass
@@ -70,7 +66,7 @@ if run_btn:
         "required": ["letter_grade", "one_sentence_verdict", "red_flags", "verified_facts"]
     }
 
-    # --- STREAMING LOGIC ---
+    # --- ROBUST STREAMING LOGIC ---
     full_report_text = ""
     final_json_obj = None
     debug_log = []
@@ -84,24 +80,33 @@ if run_btn:
                 stream=True
             )
             
+            # --- THE BUFFER PROCESSOR ---
+            # This logic fixes the "Extra Data" error by handling split packets
+            buffer = ""
+            
             for chunk in response:
-                # 1. Decode Bytes
-                line = chunk.decode("utf-8").strip() if isinstance(chunk, bytes) else str(chunk).strip()
-                if not line: continue
+                # 1. Decode Chunk
+                text_chunk = chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+                buffer += text_chunk
                 
-                # 2. Parse 'data:' payload directly (Ignore 'event:' lines)
-                if line.startswith("data:"):
-                    raw_payload = line[5:].strip() # Remove "data: " prefix
+                # 2. Process COMPLETE lines only
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
                     
-                    # Handle [DONE] signal
-                    if raw_payload == "[DONE]": break
-                    
+                    # Skip empty lines or keep-alives
+                    if not line or not line.startswith("data:"):
+                        continue
+                        
+                    # 3. Parse JSON from the line
                     try:
+                        raw_payload = line[5:].strip() # Remove "data:" prefix
+                        if raw_payload == "[DONE]": break
+                        
                         data = json.loads(raw_payload)
-                        # Extract delta
                         delta = data.get("choices", [{}])[0].get("delta", {})
                         
-                        # --- A. Handle Status (Thinking/Planning) ---
+                        # --- Handle Status (Thinking/Planning) ---
                         if "step_details" in delta:
                             step = delta["step_details"]
                             step_type = step.get("type", "")
@@ -112,21 +117,18 @@ if run_btn:
                             elif step_type == "think":
                                 status.write("💭 **Thinking...**")
 
-                        # --- B. Handle Content (The Result) ---
+                        # --- Handle Content (The Result) ---
                         if "content" in delta:
                             content = delta["content"]
-                            
                             if isinstance(content, dict):
-                                # Direct Object (Structured Stream)
                                 final_json_obj = content
                                 status.write("⚡ Receiving structured data...")
                             else:
-                                # String Token (Accumulate text)
                                 full_report_text += str(content)
                                 
                     except Exception as e:
-                        # Log parsing errors but don't stop the stream
-                        debug_log.append(f"Parse Error: {str(e)} | Line: {line[:50]}...")
+                        # Log parsing errors but don't kill the stream
+                        debug_log.append(f"Line Parse Error: {e}")
                         continue
 
             status.update(label="Audit Complete!", state="complete", expanded=False)
@@ -136,10 +138,8 @@ if run_btn:
             st.stop()
 
     # --- RESULT PARSING ---
-    # 1. Prefer the Object if we got it
     if final_json_obj:
         final_data = final_json_obj
-    # 2. Else, parse the accumulated text
     elif full_report_text:
         final_data = parse_final_json(full_report_text)
     else:
@@ -170,8 +170,8 @@ if run_btn:
             for x in final_data.get("verified_facts", []): st.write(f"• {x}")
             
     else:
-        st.error("Parsing Failed. Please check the debug log below.")
-        with st.expander("🕵️ Debug Info (Raw Data)"):
-            st.write("Stream Errors:", debug_log)
+        st.error("Parsing Failed.")
+        with st.expander("🕵️ Debug Logs"):
+            st.write(debug_log)
             st.text_area("Accumulated Text:", full_report_text)
-            st.write("Final JSON Object:", final_json_obj)
+            st.write("Final Object:", final_json_obj)
