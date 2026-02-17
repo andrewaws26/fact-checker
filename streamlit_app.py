@@ -1,9 +1,7 @@
 import streamlit as st
 from tavily import TavilyClient
-import time
 import json
 import re
-import requests  # Needed for manual polling fallback
 
 # --- 1. Page Configuration ---
 st.set_page_config(
@@ -12,7 +10,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 2. Custom CSS for Visuals ---
+# --- 2. Custom CSS ---
 st.markdown("""
     <style>
     .letter-grade { 
@@ -35,176 +33,171 @@ st.markdown("""
         border-left: 5px solid #3498db;
         padding: 15px;
         border-radius: 5px;
+        font-size: 18px;
     }
     </style>
     """, unsafe_allow_html=True)
 
 # --- 3. Helper: Robust JSON Parser ---
-def clean_and_parse_json(raw_output):
+def clean_and_parse_json(raw_text):
     """
-    Attempts to clean LLM output which often includes markdown 
-    code fences (```json ... ```) before parsing.
+    Cleans accumulated stream text (stripping markdown) and parses JSON.
     """
-    if isinstance(raw_output, dict):
-        return raw_output
+    if not raw_text: 
+        return None
         
-    # Strip markdown code blocks if present
-    text = str(raw_output)
+    text = str(raw_text)
+    # 1. Try to find JSON inside markdown code blocks
     pattern = r"```json\s*(.*?)\s*```"
     match = re.search(pattern, text, re.DOTALL)
-    
     if match:
         text = match.group(1)
         
+    # 2. Attempt Parse
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         return None
 
-# --- 4. Core Logic with Caching ---
-# We cache this function so running the same URL twice is instant and free
-@st.cache_data(show_spinner=False, ttl=3600)
-def run_audit_process(url, api_key, model_selection):
-    """
-    Wraps the API call and polling logic. 
-    Returns the final dictionary or raises an error.
-    """
-    # --- Fix 1: Clean the API Key ---
-    # Removes invisible characters or smart quotes that cause crashes
-    api_key = str(api_key).strip()
-    try:
-        api_key = api_key.encode("ascii", "ignore").decode("ascii")
-    except:
-        pass
+# --- 4. Main UI Logic ---
+st.title("⚖️ NewsGrader Pro")
+st.caption("AI-Powered Truth & Accuracy Auditor (Live Streaming)")
 
-    client = TavilyClient(api_key=api_key)
-    
-    # --- Enhanced Prompt ---
-    # Forces the AI to cross-reference instead of just reading
-    prompt = (
-        f"Act as a strict Fact-Checker. Audit this article: {url}. "
-        "Do NOT just summarize it. You must Cross-Reference claims against "
-        "authoritative, external sources to verify accuracy. "
-        "Be critical."
-    )
-
-    # --- Fix 2: Schema with Descriptions ---
-    # Every field MUST have a "description" or the API will fail
-    audit_schema = {
-        "properties": {
-            "letter_grade": {
-                "type": "string", 
-                "enum": ["A", "B", "C", "D", "F"],
-                "description": "A letter grade (A-F) evaluating the overall accuracy and truthfulness of the article."
-            },
-            "one_sentence_verdict": {
-                "type": "string",
-                "description": "A concise, single-sentence summary of the audit findings."
-            },
-            "red_flags": {
-                "type": "array", 
-                "items": {"type": "string"},
-                "description": "A list of specific inaccuracies, lies, or missing context found in the text."
-            },
-            "verified_facts": {
-                "type": "array", 
-                "items": {"type": "string"},
-                "description": "A list of specific claims that were verified as true against external sources."
-            },
-            "sources_used": {
-                "type": "array", 
-                "items": {"type": "string"},
-                "description": "A list of the names or URLs of authoritative sources used to verify the claims."
-            }
-        },
-        "required": ["letter_grade", "one_sentence_verdict", "red_flags", "verified_facts"]
-    }
-
-    try:
-        # Start the task
-        response = client.research(
-            input=prompt,
-            model=model_selection,
-            output_schema=audit_schema
-        )
-    except Exception as e:
-        return {"error": f"API Connection Failed: {str(e)}"}
-
-    # Handle Synchronous Result (Mini model usually finishes instantly)
-    if response.get("status") == "completed":
-        return clean_and_parse_json(response.get("content"))
-
-    # Handle Asynchronous Result (Pro model needs polling)
-    req_id = response.get("request_id")
-    if not req_id:
-        return {"error": "No Request ID returned from API."}
-
-    # Polling Loop (Wait for Pro model)
-    for _ in range(60): # Max 5 mins (60 * 5s)
-        time.sleep(5)
-        try:
-            # Manual polling using requests library as a fallback
-            poll_url = f"https://api.tavily.com/research/{req_id}"
-            poll_resp = requests.get(poll_url, headers={"Authorization": f"Bearer {api_key}"})
-            
-            if poll_resp.status_code == 200:
-                data = poll_resp.json()
-                if data.get("status") == "completed":
-                    return clean_and_parse_json(data.get("content"))
-                if data.get("status") == "failed":
-                    return {"error": "Task failed on Tavily server."}
-        except Exception:
-            pass
-            
-    return {"error": "Operation timed out."}
-
-# --- 5. Sidebar Settings ---
+# Sidebar
 with st.sidebar:
     st.title("⚙️ Settings")
-    
-    # Secrets handling: Check st.secrets first, fall back to empty string
     default_key = st.secrets.get("TAVILY_API_KEY", "")
     api_key = st.text_input("Tavily API Key", value=default_key, type="password")
     
     st.divider()
     research_mode = st.radio("Depth:", ["Mini (Fast)", "Pro (Deep Audit)"], index=0)
     selected_model = "mini" if "Mini" in research_mode else "pro"
-    
-    st.info("💡 **Pro Tip:** 'Mini' is good for quick fact checks. 'Pro' is better for deep-dives into long articles.")
 
-# --- 6. Main UI ---
-st.title("⚖️ NewsGrader Pro")
-st.caption("AI-Powered Truth & Accuracy Auditor")
-
-# Using st.form prevents the page from reloading/resetting when we click buttons
+# Form
 with st.form("audit_form"):
     url_input = st.text_input("Article URL", placeholder="https://www.nytimes.com/...")
     submitted = st.form_submit_button("Run Audit")
 
 if submitted:
-    # Validation
     if not api_key:
-        st.error("⚠️ Please provide a Tavily API Key in the sidebar.")
+        st.error("⚠️ Please provide a Tavily API Key.")
         st.stop()
     if not url_input:
         st.error("⚠️ Please provide a URL.")
         st.stop()
 
-    # Progress Indicator
-    with st.status("🕵️ Agent is auditing sources...", expanded=True) as status:
-        st.write("Initializing research agent...")
-        final_data = run_audit_process(url_input, api_key, selected_model)
-        
-        if "error" in final_data:
-            status.update(label="Audit Failed", state="error")
-            st.error(final_data["error"])
-            st.stop()
-        else:
-            status.update(label="Audit Complete!", state="complete", expanded=False)
+    # Clean API Key
+    clean_key = str(api_key).strip()
+    try: clean_key = clean_key.encode("ascii", "ignore").decode("ascii")
+    except: pass
+    
+    client = TavilyClient(api_key=clean_key)
 
-    # --- 7. Display Results ---
+    # --- Schema Definition ---
+    audit_schema = {
+        "properties": {
+            "letter_grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"], "description": "Overall accuracy grade (A-F)."},
+            "one_sentence_verdict": {"type": "string", "description": "Concise summary of findings."},
+            "red_flags": {"type": "array", "items": {"type": "string"}, "description": "List of inaccuracies or missing context."},
+            "verified_facts": {"type": "array", "items": {"type": "string"}, "description": "List of verified true claims."},
+            "sources_used": {"type": "array", "items": {"type": "string"}, "description": "List of authoritative sources used."}
+        },
+        "required": ["letter_grade", "one_sentence_verdict", "red_flags", "verified_facts"]
+    }
+
+    prompt = f"Act as a strict Fact-Checker. Audit this article: {url_input}. Cross-Reference claims against external sources."
+
+    # --- STREAMING LOGIC START ---
+    
+    full_json_buffer = "" # We will build the final JSON string here
+    final_data = None
+    
+    # Create a Status Container to show live updates
+    with st.status("🚀 Connecting to Research Agent...", expanded=True) as status:
+        
+        try:
+            # Call API with stream=True
+            response_stream = client.research(
+                input=prompt,
+                model=selected_model,
+                output_schema=audit_schema,
+                stream=True
+            )
+            
+            # Variables to track stream state
+            current_event_type = None
+            last_step_msg = ""
+            
+            # Iterate through the stream chunks
+            for chunk in response_stream:
+                # Decode bytes to string if needed
+                line = chunk.decode("utf-8").strip() if isinstance(chunk, bytes) else str(chunk).strip()
+                if not line: continue
+
+                # Manual SSE (Server-Sent Events) Parsing
+                # The Tavily API sends "event: ..." followed by "data: ..."
+                
+                if line.startswith("event:"):
+                    current_event_type = line.split("event:", 1)[1].strip()
+                    
+                elif line.startswith("data:"):
+                    # Parse the JSON data payload inside the SSE line
+                    try:
+                        data_str = line.split("data:", 1)[1].strip()
+                        data = json.loads(data_str)
+                    except:
+                        continue # Skip malformed lines
+
+                    # A. Handle Final Content (The Report/JSON)
+                    if current_event_type == "chat.completion.chunk":
+                        delta = data.get("choices", [{}])[0].get("delta", {})
+                        if "content" in delta:
+                            content_chunk = delta["content"]
+                            full_json_buffer += content_chunk
+                            # Optionally show raw JSON building up (can be noisy)
+                            # status.markdown(f"Writing report... {len(full_json_buffer)} chars")
+
+                    # B. Handle Research Steps (The "What is it doing?" part)
+                    elif "step_details" in delta:
+                        step = delta["step_details"]
+                        step_type = step.get("type")
+                        
+                        # 1. Plan
+                        if step_type == "research_plan":
+                            plan = step.get("step", "Planning...")
+                            status.write(f"📋 **Plan:** {plan}")
+                            
+                        # 2. Research (Searching)
+                        elif step_type == "research":
+                            msg = step.get("step", "")
+                            if msg != last_step_msg: # Avoid duplicates
+                                status.write(f"🔍 **Searching:** {msg}")
+                                last_step_msg = msg
+                                
+                        # 3. Thinking
+                        elif step_type == "think":
+                            status.write(f"💭 **Thinking:** {step.get('step', '')}")
+
+                    # C. Handle Tool Calls (Specific URLs being visited)
+                    elif "tool_calls" in delta:
+                        # Sometimes tool calls appear here depending on API version
+                        pass
+
+            # Loop finished
+            status.update(label="Audit Complete!", state="complete", expanded=False)
+            
+        except Exception as e:
+            st.error(f"Stream Error: {str(e)}")
+            st.stop()
+
+    # --- STREAMING LOGIC END ---
+
+    # Parse the accumulated JSON
+    if full_json_buffer:
+        final_data = clean_and_parse_json(full_json_buffer)
+    
+    # --- 5. Display Results (Same as before) ---
     if final_data:
-        # Define Color Logic
         grade_map = {
             "A": ("#2ecc71", "High Accuracy"), 
             "B": ("#3498db", "Mostly Accurate"), 
@@ -214,12 +207,9 @@ if submitted:
         }
         
         grade = final_data.get("letter_grade", "C")
-        # Fallback color if grade is weird
         color, label = grade_map.get(grade, ("#95a5a6", "Unknown"))
         
         st.divider()
-        
-        # Hero Section: Grade + Verdict
         col1, col2 = st.columns([1, 4])
         with col1:
             st.markdown(f"""
@@ -233,29 +223,26 @@ if submitted:
             st.markdown(f"### 🔍 Verdict")
             st.markdown(f"<div class='verdict-box'>{final_data.get('one_sentence_verdict', 'No verdict provided.')}</div>", unsafe_allow_html=True)
             
-            # Show sources if available
             sources = final_data.get("sources_used", [])
             if sources:
                 st.caption(f"📚 **Verified against:** {', '.join(sources[:3])}...")
 
-        # Details Section: Two Columns
         st.divider()
         c1, c2 = st.columns(2)
-        
         with c1:
-            st.subheader("🛑 Red Flags & Omissions")
+            st.subheader("🛑 Red Flags")
             flags = final_data.get("red_flags", [])
-            if not flags:
-                st.success("✅ No major issues found.")
+            if not flags: st.success("✅ No major issues.")
             else:
-                for flag in flags:
-                    st.warning(f"• {flag}")
+                for flag in flags: st.warning(f"• {flag}")
 
         with c2:
             st.subheader("✅ Verified Facts")
             facts = final_data.get("verified_facts", [])
-            if not facts:
-                st.write("⚠️ No facts could be independently verified.")
+            if not facts: st.write("⚠️ No verifiable facts found.")
             else:
-                for fact in facts:
-                    st.success(f"• {fact}")
+                for fact in facts: st.success(f"• {fact}")
+    else:
+        st.error("Failed to parse the final report.")
+        with st.expander("Debug Raw Output"):
+            st.code(full_json_buffer)
