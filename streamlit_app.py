@@ -19,7 +19,6 @@ st.markdown("""
 def clean_and_parse_json(raw_text):
     if not raw_text: return None
     text = str(raw_text)
-    # Extract JSON from markdown code blocks if present
     match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
     if match: text = match.group(1)
     try:
@@ -38,7 +37,6 @@ with st.sidebar:
     st.divider()
     model = "mini" if st.radio("Depth:", ["Mini", "Pro"]) == "Mini" else "pro"
 
-# Using st.form ensures stability
 with st.form("audit"):
     url = st.text_input("Article URL", placeholder="https://example.com/...")
     run_btn = st.form_submit_button("Run Audit")
@@ -47,10 +45,15 @@ if run_btn:
     if not api_key or not url:
         st.error("Please check your API Key and URL.")
         st.stop()
-        
-    client = TavilyClient(api_key=api_key.strip())
     
-    # Define Strict Schema
+    # --- Clean API Key ---
+    safe_key = str(api_key).strip()
+    try: safe_key = safe_key.encode("ascii", "ignore").decode("ascii")
+    except: pass
+        
+    client = TavilyClient(api_key=safe_key)
+    
+    # --- Schema ---
     schema = {
         "properties": {
             "letter_grade": {"type": "string", "enum": ["A","B","C","D","F"], "description": "Grade (A-F) of accuracy."},
@@ -62,8 +65,9 @@ if run_btn:
         "required": ["letter_grade", "one_sentence_verdict", "red_flags", "verified_facts"]
     }
 
-    # --- ROBUST STREAMING LOGIC ---
-    full_json = ""
+    # --- STREAMING LOGIC ---
+    full_json_str = ""  # For accumulating string tokens
+    final_data = None   # For capturing direct object responses
     
     with st.status("🚀 Connecting to Agent...", expanded=True) as status:
         try:
@@ -74,37 +78,48 @@ if run_btn:
                 stream=True
             )
             
-            # Buffer for partial chunks
             buffer = ""
             
             for chunk in stream:
-                # 1. Decode bytes to string
+                # Decode chunk
                 text_chunk = chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
                 buffer += text_chunk
                 
-                # 2. Process complete lines only
+                # Process complete lines
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
                     line = line.strip()
                     
                     if line.startswith("data:"):
+                        # Parse SSE Data
+                        data_str = line[5:].strip()
                         try:
-                            # Parse the inner JSON data
-                            data_str = line[5:].strip() # Remove "data:" prefix
                             data = json.loads(data_str)
-                            
-                            # Handle Content (Building the Report)
-                            delta = data.get("choices", [{}])[0].get("delta", {})
-                            if "content" in delta:
-                                full_json += delta["content"]
-                                
-                            # Handle Status Updates (Logs)
-                            if "step_details" in delta:
-                                step = delta["step_details"]
-                                msg = step.get("step", "")
-                                if msg: status.write(f"⚡ {msg}")
                         except:
-                            continue
+                            continue # Skip invalid JSON lines
+
+                        # Extract Delta
+                        delta = data.get("choices", [{}])[0].get("delta", {})
+                        
+                        # HANDLE CONTENT (Text vs Object)
+                        if "content" in delta:
+                            content = delta["content"]
+                            
+                            # Case A: String Token (Standard Streaming)
+                            if isinstance(content, str):
+                                full_json_str += content
+                                
+                            # Case B: Dictionary Object (Structured Streaming)
+                            elif isinstance(content, dict):
+                                final_data = content
+                                # If we get the full object, we might want to update status
+                                status.write("⚡ Receiving structured data...")
+
+                        # Handle Status Updates
+                        if "step_details" in delta:
+                            step = delta["step_details"]
+                            msg = step.get("step", "")
+                            if msg: status.write(f"⚡ {msg}")
             
             status.update(label="Audit Complete!", state="complete", expanded=False)
             
@@ -112,11 +127,13 @@ if run_btn:
             st.error(f"Stream Error: {e}")
             st.stop()
 
-    # --- Display Results ---
-    final_data = clean_and_parse_json(full_json)
+    # --- RESULT PARSING ---
+    # Prioritize the Dict object if we got one, otherwise parse the String buffer
+    if final_data is None and full_json_str:
+        final_data = clean_and_parse_json(full_json_str)
     
+    # --- DISPLAY ---
     if final_data:
-        # Define Colors
         colors = {"A": "#2ecc71", "B": "#3498db", "C": "#f1c40f", "D": "#e67e22", "F": "#e74c3c"}
         grade = final_data.get("letter_grade", "C")
         
@@ -140,5 +157,7 @@ if run_btn:
             for x in final_data.get("verified_facts", []): st.write(f"• {x}")
             
     else:
-        st.error("Parsing Failed. Raw Output below:")
-        st.code(full_json)
+        st.error("Parsing Failed. The agent returned no data.")
+        with st.expander("Debug Raw Output"):
+            st.text(f"String Buffer: {full_json_str}")
+            st.text(f"Dict Object: {final_data}")
