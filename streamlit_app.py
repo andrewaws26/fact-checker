@@ -16,15 +16,16 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # --- 3. Helper: JSON Cleaner ---
-def clean_and_parse_json(raw_text):
-    if not raw_text: return None
-    # If we already have a dict (from structured stream), return it
-    if isinstance(raw_text, dict): return raw_text
+def parse_final_json(raw_data):
+    # If it's already a dictionary, return it
+    if isinstance(raw_data, dict): return raw_data
+    if not raw_data: return None
     
-    text = str(raw_text)
-    # Remove markdown code fences if present
+    text = str(raw_data)
+    # Remove markdown code fences
     match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
     if match: text = match.group(1)
+    
     try:
         return json.loads(text)
     except:
@@ -50,14 +51,14 @@ if run_btn:
         st.error("Please check your API Key and URL.")
         st.stop()
     
-    # --- Clean API Key (Prevents latin-1 crash) ---
+    # Clean API Key
     safe_key = str(api_key).strip()
     try: safe_key = safe_key.encode("ascii", "ignore").decode("ascii")
     except: pass
         
     client = TavilyClient(api_key=safe_key)
     
-    # --- Strict Schema ---
+    # Strict Schema
     schema = {
         "properties": {
             "letter_grade": {"type": "string", "enum": ["A","B","C","D","F"], "description": "Grade (A-F) of accuracy."},
@@ -69,9 +70,10 @@ if run_btn:
         "required": ["letter_grade", "one_sentence_verdict", "red_flags", "verified_facts"]
     }
 
-    # --- OFFICIAL STREAMING LOGIC ---
-    full_report = ""
-    final_json_object = None
+    # --- STREAMING LOGIC ---
+    full_report_text = ""
+    final_json_obj = None
+    debug_log = []
     
     with st.status("🚀 Connecting to Agent...", expanded=True) as status:
         try:
@@ -82,75 +84,67 @@ if run_btn:
                 stream=True
             )
             
-            # Variables to track stream state
-            current_event_type = None
-            
-            # --- THE LOOP (Adapted from Official Docs) ---
             for chunk in response:
-                # 1. Decode bytes to string
+                # 1. Decode Bytes
                 line = chunk.decode("utf-8").strip() if isinstance(chunk, bytes) else str(chunk).strip()
                 if not line: continue
-
-                # 2. Parse SSE Event Type
-                if line.startswith("event:"):
-                    current_event_type = line.split("event:", 1)[1].strip()
                 
-                # 3. Parse Data Payload
-                elif line.startswith("data:"):
+                # 2. Parse 'data:' payload directly (Ignore 'event:' lines)
+                if line.startswith("data:"):
+                    raw_payload = line[5:].strip() # Remove "data: " prefix
+                    
+                    # Handle [DONE] signal
+                    if raw_payload == "[DONE]": break
+                    
                     try:
-                        data = json.loads(line.split("data:", 1)[1].strip())
-                    except:
-                        continue # Skip malformed JSON
-
-                    # Handle Chat Completion Chunk
-                    if current_event_type == "chat.completion.chunk":
+                        data = json.loads(raw_payload)
+                        # Extract delta
                         delta = data.get("choices", [{}])[0].get("delta", {})
                         
-                        # A. Handle Content (Building the Report)
+                        # --- A. Handle Status (Thinking/Planning) ---
+                        if "step_details" in delta:
+                            step = delta["step_details"]
+                            step_type = step.get("type", "")
+                            if step_type == "research_plan":
+                                status.write(f"📋 **Plan:** {step.get('step', 'Planning...')}")
+                            elif step_type == "research":
+                                status.write(f"🔍 **Researching:** {step.get('step', 'Searching...')}")
+                            elif step_type == "think":
+                                status.write("💭 **Thinking...**")
+
+                        # --- B. Handle Content (The Result) ---
                         if "content" in delta:
                             content = delta["content"]
                             
-                            # Structured Output often sends the WHOLE object at once in streaming
                             if isinstance(content, dict):
-                                final_json_object = content
+                                # Direct Object (Structured Stream)
+                                final_json_obj = content
                                 status.write("⚡ Receiving structured data...")
-                            # Or it sends string tokens
                             else:
-                                full_report += str(content)
+                                # String Token (Accumulate text)
+                                full_report_text += str(content)
+                                
+                    except Exception as e:
+                        # Log parsing errors but don't stop the stream
+                        debug_log.append(f"Parse Error: {str(e)} | Line: {line[:50]}...")
+                        continue
 
-                        # B. Handle Research Steps (Visual Feedback)
-                        elif "step_details" in delta:
-                            step = delta["step_details"]
-                            step_type = step.get("type", "")
-                            
-                            if step_type == "research_plan":
-                                plan = step.get("step", "Planning...")
-                                status.write(f"📋 **Plan:** {plan}")
-                            elif step_type == "research":
-                                msg = step.get("step", "Researching...")
-                                status.write(f"🔍 **Researching:** {msg}")
-                            elif step_type == "think":
-                                status.write(f"💭 **Thinking...**")
-
-                        # C. Handle Tool Calls (Optional: Show URLs being visited)
-                        elif "tool_calls" in delta:
-                            # You can parse this to show exactly which URLs are clicked
-                            pass
-            
             status.update(label="Audit Complete!", state="complete", expanded=False)
             
         except Exception as e:
-            st.error(f"Stream Error: {e}")
+            st.error(f"Stream Connection Error: {e}")
             st.stop()
 
     # --- RESULT PARSING ---
-    # 1. Prefer the direct JSON object if the API sent it
-    if final_json_object:
-        final_data = final_json_object
-    # 2. Otherwise, parse the accumulated string
+    # 1. Prefer the Object if we got it
+    if final_json_obj:
+        final_data = final_json_obj
+    # 2. Else, parse the accumulated text
+    elif full_report_text:
+        final_data = parse_final_json(full_report_text)
     else:
-        final_data = clean_and_parse_json(full_report)
-    
+        final_data = None
+
     # --- DISPLAY ---
     if final_data:
         colors = {"A": "#2ecc71", "B": "#3498db", "C": "#f1c40f", "D": "#e67e22", "F": "#e74c3c"}
@@ -176,6 +170,8 @@ if run_btn:
             for x in final_data.get("verified_facts", []): st.write(f"• {x}")
             
     else:
-        st.error("Parsing Failed. The agent returned no valid data.")
-        with st.expander("Debug Raw Output"):
-            st.text(full_report)
+        st.error("Parsing Failed. Please check the debug log below.")
+        with st.expander("🕵️ Debug Info (Raw Data)"):
+            st.write("Stream Errors:", debug_log)
+            st.text_area("Accumulated Text:", full_report_text)
+            st.write("Final JSON Object:", final_json_obj)
