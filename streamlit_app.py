@@ -3,11 +3,16 @@ from tavily import TavilyClient
 import time
 import json
 import re
+import requests  # Needed for manual polling fallback
 
-# --- Page Config ---
-st.set_page_config(page_title="NewsGrader Pro", page_icon="⚖️", layout="wide")
+# --- 1. Page Configuration ---
+st.set_page_config(
+    page_title="NewsGrader Pro", 
+    page_icon="⚖️", 
+    layout="wide"
+)
 
-# --- CSS Styling ---
+# --- 2. Custom CSS for Visuals ---
 st.markdown("""
     <style>
     .letter-grade { 
@@ -23,11 +28,18 @@ st.markdown("""
         border-radius: 10px;
         padding: 20px;
         height: 100%;
+        text-align: center;
+    }
+    .verdict-box {
+        background-color: #eef2f5;
+        border-left: 5px solid #3498db;
+        padding: 15px;
+        border-radius: 5px;
     }
     </style>
     """, unsafe_allow_html=True)
 
-# --- Helper: Robust JSON Parser ---
+# --- 3. Helper: Robust JSON Parser ---
 def clean_and_parse_json(raw_output):
     """
     Attempts to clean LLM output which often includes markdown 
@@ -49,7 +61,7 @@ def clean_and_parse_json(raw_output):
     except json.JSONDecodeError:
         return None
 
-# --- Core Logic with Caching ---
+# --- 4. Core Logic with Caching ---
 # We cache this function so running the same URL twice is instant and free
 @st.cache_data(show_spinner=False, ttl=3600)
 def run_audit_process(url, api_key, model_selection):
@@ -57,9 +69,18 @@ def run_audit_process(url, api_key, model_selection):
     Wraps the API call and polling logic. 
     Returns the final dictionary or raises an error.
     """
+    # --- Fix 1: Clean the API Key ---
+    # Removes invisible characters or smart quotes that cause crashes
+    api_key = str(api_key).strip()
+    try:
+        api_key = api_key.encode("ascii", "ignore").decode("ascii")
+    except:
+        pass
+
     client = TavilyClient(api_key=api_key)
     
-    # Enhanced prompt to ensure external verification
+    # --- Enhanced Prompt ---
+    # Forces the AI to cross-reference instead of just reading
     prompt = (
         f"Act as a strict Fact-Checker. Audit this article: {url}. "
         "Do NOT just summarize it. You must Cross-Reference claims against "
@@ -67,14 +88,34 @@ def run_audit_process(url, api_key, model_selection):
         "Be critical."
     )
 
-    # Schema Definition
+    # --- Fix 2: Schema with Descriptions ---
+    # Every field MUST have a "description" or the API will fail
     audit_schema = {
         "properties": {
-            "letter_grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"]},
-            "one_sentence_verdict": {"type": "string"},
-            "red_flags": {"type": "array", "items": {"type": "string"}},
-            "verified_facts": {"type": "array", "items": {"type": "string"}},
-            "sources_used": {"type": "array", "items": {"type": "string"}} # Added this field
+            "letter_grade": {
+                "type": "string", 
+                "enum": ["A", "B", "C", "D", "F"],
+                "description": "A letter grade (A-F) evaluating the overall accuracy and truthfulness of the article."
+            },
+            "one_sentence_verdict": {
+                "type": "string",
+                "description": "A concise, single-sentence summary of the audit findings."
+            },
+            "red_flags": {
+                "type": "array", 
+                "items": {"type": "string"},
+                "description": "A list of specific inaccuracies, lies, or missing context found in the text."
+            },
+            "verified_facts": {
+                "type": "array", 
+                "items": {"type": "string"},
+                "description": "A list of specific claims that were verified as true against external sources."
+            },
+            "sources_used": {
+                "type": "array", 
+                "items": {"type": "string"},
+                "description": "A list of the names or URLs of authoritative sources used to verify the claims."
+            }
         },
         "required": ["letter_grade", "one_sentence_verdict", "red_flags", "verified_facts"]
     }
@@ -89,24 +130,21 @@ def run_audit_process(url, api_key, model_selection):
     except Exception as e:
         return {"error": f"API Connection Failed: {str(e)}"}
 
-    # Handle Synchronous Result (Mini)
+    # Handle Synchronous Result (Mini model usually finishes instantly)
     if response.get("status") == "completed":
         return clean_and_parse_json(response.get("content"))
 
-    # Handle Asynchronous Result (Pro)
+    # Handle Asynchronous Result (Pro model needs polling)
     req_id = response.get("request_id")
     if not req_id:
         return {"error": "No Request ID returned from API."}
 
-    # Polling Loop
-    for _ in range(60): # Max 5 mins
+    # Polling Loop (Wait for Pro model)
+    for _ in range(60): # Max 5 mins (60 * 5s)
         time.sleep(5)
         try:
-            # Note: We use the requests library manually here to poll
-            poll_res = client.get_search_context(query=req_id) # Using a dummy call or direct request if client lacks poll
-            # Since standard client might not expose 'poll', we revert to requests if needed:
-            import requests
-            poll_url = f"[https://api.tavily.com/research/](https://api.tavily.com/research/){req_id}"
+            # Manual polling using requests library as a fallback
+            poll_url = f"https://api.tavily.com/research/{req_id}"
             poll_resp = requests.get(poll_url, headers={"Authorization": f"Bearer {api_key}"})
             
             if poll_resp.status_code == 200:
@@ -120,9 +158,11 @@ def run_audit_process(url, api_key, model_selection):
             
     return {"error": "Operation timed out."}
 
-# --- Sidebar ---
+# --- 5. Sidebar Settings ---
 with st.sidebar:
     st.title("⚙️ Settings")
+    
+    # Secrets handling: Check st.secrets first, fall back to empty string
     default_key = st.secrets.get("TAVILY_API_KEY", "")
     api_key = st.text_input("Tavily API Key", value=default_key, type="password")
     
@@ -132,16 +172,17 @@ with st.sidebar:
     
     st.info("💡 **Pro Tip:** 'Mini' is good for quick fact checks. 'Pro' is better for deep-dives into long articles.")
 
-# --- Main UI ---
+# --- 6. Main UI ---
 st.title("⚖️ NewsGrader Pro")
 st.caption("AI-Powered Truth & Accuracy Auditor")
 
-# Using a Form ensures the page doesn't reload/reset when we click buttons
+# Using st.form prevents the page from reloading/resetting when we click buttons
 with st.form("audit_form"):
-    url_input = st.text_input("Article URL", placeholder="[https://www.nytimes.com/](https://www.nytimes.com/)...")
+    url_input = st.text_input("Article URL", placeholder="https://www.nytimes.com/...")
     submitted = st.form_submit_button("Run Audit")
 
 if submitted:
+    # Validation
     if not api_key:
         st.error("⚠️ Please provide a Tavily API Key in the sidebar.")
         st.stop()
@@ -161,9 +202,9 @@ if submitted:
         else:
             status.update(label="Audit Complete!", state="complete", expanded=False)
 
-    # --- Display Results ---
+    # --- 7. Display Results ---
     if final_data:
-        # Define Colors
+        # Define Color Logic
         grade_map = {
             "A": ("#2ecc71", "High Accuracy"), 
             "B": ("#3498db", "Mostly Accurate"), 
@@ -173,11 +214,12 @@ if submitted:
         }
         
         grade = final_data.get("letter_grade", "C")
+        # Fallback color if grade is weird
         color, label = grade_map.get(grade, ("#95a5a6", "Unknown"))
         
         st.divider()
         
-        # Hero Section
+        # Hero Section: Grade + Verdict
         col1, col2 = st.columns([1, 4])
         with col1:
             st.markdown(f"""
@@ -189,13 +231,14 @@ if submitted:
         
         with col2:
             st.markdown(f"### 🔍 Verdict")
-            st.info(final_data.get("one_sentence_verdict", "No verdict provided."))
-            # Optional: Display source count if available
+            st.markdown(f"<div class='verdict-box'>{final_data.get('one_sentence_verdict', 'No verdict provided.')}</div>", unsafe_allow_html=True)
+            
+            # Show sources if available
             sources = final_data.get("sources_used", [])
             if sources:
-                st.caption(f"📚 Verified against {len(sources)} external sources.")
+                st.caption(f"📚 **Verified against:** {', '.join(sources[:3])}...")
 
-        # Details Section
+        # Details Section: Two Columns
         st.divider()
         c1, c2 = st.columns(2)
         
@@ -203,10 +246,10 @@ if submitted:
             st.subheader("🛑 Red Flags & Omissions")
             flags = final_data.get("red_flags", [])
             if not flags:
-                st.write("✅ No major issues found.")
+                st.success("✅ No major issues found.")
             else:
                 for flag in flags:
-                    st.warning(f"{flag}")
+                    st.warning(f"• {flag}")
 
         with c2:
             st.subheader("✅ Verified Facts")
@@ -215,4 +258,4 @@ if submitted:
                 st.write("⚠️ No facts could be independently verified.")
             else:
                 for fact in facts:
-                    st.success(f"{fact}")
+                    st.success(f"• {fact}")
