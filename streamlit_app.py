@@ -1,201 +1,218 @@
 import streamlit as st
 from tavily import TavilyClient
-import requests
 import time
 import json
+import re
 
 # --- Page Config ---
-st.set_page_config(page_title="NewsGrader Pro", page_icon="⚖️", layout="centered")
+st.set_page_config(page_title="NewsGrader Pro", page_icon="⚖️", layout="wide")
 
+# --- CSS Styling ---
 st.markdown("""
     <style>
-    .letter-grade { font-size: 100px; font-weight: bold; text-align: center; margin-bottom: 0px; }
-    .verdict-box { background-color: #f0f2f6; padding: 20px; border-radius: 10px; text-align: center; margin-bottom: 20px; }
+    .letter-grade { 
+        font-size: 80px; 
+        font-weight: 800; 
+        text-align: center; 
+        line-height: 1;
+        margin-bottom: 10px;
+    }
+    .metric-card {
+        background-color: #f8f9fa;
+        border: 1px solid #e9ecef;
+        border-radius: 10px;
+        padding: 20px;
+        height: 100%;
+    }
     </style>
     """, unsafe_allow_html=True)
 
-# --- Sidebar: Settings ---
+# --- Helper: Robust JSON Parser ---
+def clean_and_parse_json(raw_output):
+    """
+    Attempts to clean LLM output which often includes markdown 
+    code fences (```json ... ```) before parsing.
+    """
+    if isinstance(raw_output, dict):
+        return raw_output
+        
+    # Strip markdown code blocks if present
+    text = str(raw_output)
+    pattern = r"```json\s*(.*?)\s*```"
+    match = re.search(pattern, text, re.DOTALL)
+    
+    if match:
+        text = match.group(1)
+        
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+# --- Core Logic with Caching ---
+# We cache this function so running the same URL twice is instant and free
+@st.cache_data(show_spinner=False, ttl=3600)
+def run_audit_process(url, api_key, model_selection):
+    """
+    Wraps the API call and polling logic. 
+    Returns the final dictionary or raises an error.
+    """
+    client = TavilyClient(api_key=api_key)
+    
+    # Enhanced prompt to ensure external verification
+    prompt = (
+        f"Act as a strict Fact-Checker. Audit this article: {url}. "
+        "Do NOT just summarize it. You must Cross-Reference claims against "
+        "authoritative, external sources to verify accuracy. "
+        "Be critical."
+    )
+
+    # Schema Definition
+    audit_schema = {
+        "properties": {
+            "letter_grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"]},
+            "one_sentence_verdict": {"type": "string"},
+            "red_flags": {"type": "array", "items": {"type": "string"}},
+            "verified_facts": {"type": "array", "items": {"type": "string"}},
+            "sources_used": {"type": "array", "items": {"type": "string"}} # Added this field
+        },
+        "required": ["letter_grade", "one_sentence_verdict", "red_flags", "verified_facts"]
+    }
+
+    try:
+        # Start the task
+        response = client.research(
+            input=prompt,
+            model=model_selection,
+            output_schema=audit_schema
+        )
+    except Exception as e:
+        return {"error": f"API Connection Failed: {str(e)}"}
+
+    # Handle Synchronous Result (Mini)
+    if response.get("status") == "completed":
+        return clean_and_parse_json(response.get("content"))
+
+    # Handle Asynchronous Result (Pro)
+    req_id = response.get("request_id")
+    if not req_id:
+        return {"error": "No Request ID returned from API."}
+
+    # Polling Loop
+    for _ in range(60): # Max 5 mins
+        time.sleep(5)
+        try:
+            # Note: We use the requests library manually here to poll
+            poll_res = client.get_search_context(query=req_id) # Using a dummy call or direct request if client lacks poll
+            # Since standard client might not expose 'poll', we revert to requests if needed:
+            import requests
+            poll_url = f"[https://api.tavily.com/research/](https://api.tavily.com/research/){req_id}"
+            poll_resp = requests.get(poll_url, headers={"Authorization": f"Bearer {api_key}"})
+            
+            if poll_resp.status_code == 200:
+                data = poll_resp.json()
+                if data.get("status") == "completed":
+                    return clean_and_parse_json(data.get("content"))
+                if data.get("status") == "failed":
+                    return {"error": "Task failed on Tavily server."}
+        except Exception:
+            pass
+            
+    return {"error": "Operation timed out."}
+
+# --- Sidebar ---
 with st.sidebar:
     st.title("⚙️ Settings")
-    
-    # Hybrid Key: Secrets first, then UI override
     default_key = st.secrets.get("TAVILY_API_KEY", "")
     api_key = st.text_input("Tavily API Key", value=default_key, type="password")
     
     st.divider()
-    research_mode = st.radio("Depth:", ["Mini (Fast)", "Pro (Deep Audit)"])
+    research_mode = st.radio("Depth:", ["Mini (Fast)", "Pro (Deep Audit)"], index=0)
     selected_model = "mini" if "Mini" in research_mode else "pro"
-
-# --- The Strict JSON Schema ---
-# This tells Tavily EXACTLY how to format the answer. No more Regex!
-AUDIT_SCHEMA = {
-    "properties": {
-        "letter_grade": {
-            "type": "string",
-            "enum": ["A", "B", "C", "D", "F"],
-            "description": "The overall truthfulness grade."
-        },
-        "one_sentence_verdict": {
-            "type": "string",
-            "description": "A concise summary of the findings."
-        },
-        "red_flags": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "List of lies, distortions, or missing context."
-        },
-        "verified_facts": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "List of claims that are true and verified."
-        }
-    },
-    "required": ["letter_grade", "one_sentence_verdict", "red_flags", "verified_facts"]
-}
-
-# --- Core Logic ---
-def start_audit_task(url, key, model):
-    """Starts the research job and returns the Ticket ID (or result if fast)."""
-    client = TavilyClient(api_key=key)
     
-    prompt = f"Audit this article for accuracy: {url}"
-    
-    try:
-        # We pass the schema here to force JSON output
-        response = client.research(
-            input=prompt,
-            model=model,
-            output_schema=AUDIT_SCHEMA
-        )
-        return response
-    except Exception as e:
-        return {"error": str(e)}
-
-def poll_for_result(request_id, key):
-    """Manually checks the /research/{id} endpoint from your docs."""
-    url = f"https://api.tavily.com/research/{request_id}"
-    headers = {"Authorization": f"Bearer {key}"}
-    
-    try:
-        # Simple GET request based on the OpenAPI spec you provided
-        res = requests.get(url, headers=headers)
-        if res.status_code == 200:
-            return res.json()
-    except:
-        pass
-    return {"status": "error"}
+    st.info("💡 **Pro Tip:** 'Mini' is good for quick fact checks. 'Pro' is better for deep-dives into long articles.")
 
 # --- Main UI ---
 st.title("⚖️ NewsGrader Pro")
-st.caption("Powered by Tavily Research API • Structured Data")
+st.caption("AI-Powered Truth & Accuracy Auditor")
 
-url_input = st.text_input("Article URL", placeholder="https://www.example.com/...")
+# Using a Form ensures the page doesn't reload/reset when we click buttons
+with st.form("audit_form"):
+    url_input = st.text_input("Article URL", placeholder="[https://www.nytimes.com/](https://www.nytimes.com/)...")
+    submitted = st.form_submit_button("Run Audit")
 
-if st.button("Run Audit"):
+if submitted:
     if not api_key:
-        st.error("Please provide an API Key.")
+        st.error("⚠️ Please provide a Tavily API Key in the sidebar.")
         st.stop()
-    
     if not url_input:
-        st.error("Please provide a URL.")
+        st.error("⚠️ Please provide a URL.")
         st.stop()
 
-    # 1. Start the Job
-    with st.status("🚀 Initializing Agent...", expanded=True) as status:
-        initial_res = start_audit_task(url_input, api_key, selected_model)
+    # Progress Indicator
+    with st.status("🕵️ Agent is auditing sources...", expanded=True) as status:
+        st.write("Initializing research agent...")
+        final_data = run_audit_process(url_input, api_key, selected_model)
         
-        # Check for immediate errors
-        if "error" in initial_res:
-            st.error(f"Failed to start: {initial_res['error']}")
+        if "error" in final_data:
+            status.update(label="Audit Failed", state="error")
+            st.error(final_data["error"])
             st.stop()
-            
-        # 2. Handle Sync Result (Mini often finishes instantly)
-        if initial_res.get("status") == "completed":
-            final_data = initial_res.get("content", {})
-            # If content is string (json string), parse it
-            if isinstance(final_data, str):
-                try: final_data = json.loads(final_data)
-                except: pass
-            
-            status.update(label="Audit Complete!", state="complete", expanded=False)
-
-        # 3. Handle Async Result (Pro needs polling)
         else:
-            req_id = initial_res.get("request_id")
-            if not req_id:
-                st.error("No Request ID returned.")
-                st.stop()
-                
-            # Polling Loop (Max 5 mins for Pro)
-            progress_bar = st.progress(0, text="🕵️ Agent is reading sources...")
-            final_data = None
-            
-            for i in range(60): # 60 * 5s = 5 minutes
-                time.sleep(5)
-                
-                # Update UI
-                pct = min((i*2)/100, 0.95)
-                progress_bar.progress(pct, text=f"🧠 Analyzing claims ({i*5}s elapsed)...")
-                
-                # Check API
-                poll_data = poll_for_result(req_id, api_key)
-                
-                if poll_data.get("status") == "completed":
-                    final_data = poll_data.get("content")
-                    # Should be a dict because of output_schema, but safety first
-                    if isinstance(final_data, str):
-                         try: final_data = json.loads(final_data)
-                         except: pass
-                    break
-                
-                if poll_data.get("status") == "failed":
-                    st.error("Research task failed on server side.")
-                    st.stop()
-            
-            progress_bar.empty()
-            if not final_data:
-                st.error("Timed out waiting for Pro agent.")
-                st.stop()
-            
             status.update(label="Audit Complete!", state="complete", expanded=False)
 
-    # --- 4. Display Structured Results ---
-    # Now we assume final_data is a dictionary matching our Schema
-    
-    if isinstance(final_data, dict):
-        grade = final_data.get("letter_grade", "N/A")
-        verdict = final_data.get("one_sentence_verdict", "No verdict available.")
-        bad_stuff = final_data.get("red_flags", [])
-        good_stuff = final_data.get("verified_facts", [])
+    # --- Display Results ---
+    if final_data:
+        # Define Colors
+        grade_map = {
+            "A": ("#2ecc71", "High Accuracy"), 
+            "B": ("#3498db", "Mostly Accurate"), 
+            "C": ("#f1c40f", "Mixed Accuracy"), 
+            "D": ("#e67e22", "Questionable"), 
+            "F": ("#e74c3c", "Misleading/False")
+        }
         
-        # Color Logic
-        grade_colors = {"A": "#2ecc71", "B": "#3498db", "C": "#f1c40f", "D": "#e67e22", "F": "#e74c3c"}
-        color = grade_colors.get(grade, "#95a5a6")
+        grade = final_data.get("letter_grade", "C")
+        color, label = grade_map.get(grade, ("#95a5a6", "Unknown"))
         
         st.divider()
         
-        # The Hero Section
-        col1, col2 = st.columns([1, 2])
+        # Hero Section
+        col1, col2 = st.columns([1, 4])
         with col1:
-            st.markdown(f"<div class='letter-grade' style='color: {color};'>{grade}</div>", unsafe_allow_html=True)
+            st.markdown(f"""
+            <div class='metric-card'>
+                <div class='letter-grade' style='color: {color};'>{grade}</div>
+                <div style='text-align: center; font-weight: bold;'>{label}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
         with col2:
-            st.markdown(f"### 🔍 Auditor's Verdict")
-            st.info(verdict)
+            st.markdown(f"### 🔍 Verdict")
+            st.info(final_data.get("one_sentence_verdict", "No verdict provided."))
+            # Optional: Display source count if available
+            sources = final_data.get("sources_used", [])
+            if sources:
+                st.caption(f"📚 Verified against {len(sources)} external sources.")
 
-        # The Details
+        # Details Section
+        st.divider()
         c1, c2 = st.columns(2)
+        
         with c1:
-            st.markdown("### 🛑 Red Flags")
-            if not bad_stuff: st.write("No major red flags found.")
-            for flag in bad_stuff:
-                st.error(f"• {flag}")
-                
-        with c2:
-            st.markdown("### ✅ Verified Facts")
-            if not good_stuff: st.write("No verified facts found.")
-            for fact in good_stuff:
-                st.success(f"• {fact}")
+            st.subheader("🛑 Red Flags & Omissions")
+            flags = final_data.get("red_flags", [])
+            if not flags:
+                st.write("✅ No major issues found.")
+            else:
+                for flag in flags:
+                    st.warning(f"{flag}")
 
-    else:
-        st.warning("Raw Output (Could not parse JSON):")
-        st.write(final_data)
+        with c2:
+            st.subheader("✅ Verified Facts")
+            facts = final_data.get("verified_facts", [])
+            if not facts:
+                st.write("⚠️ No facts could be independently verified.")
+            else:
+                for fact in facts:
+                    st.success(f"{fact}")
